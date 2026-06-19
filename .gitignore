@@ -2,8 +2,12 @@
 
 # dependencies
 /node_modules
+server/node_modules
 /.pnp
 .pnp.js
+
+# server temp uploads
+server/tmp/
 
 # testing
 /coverage

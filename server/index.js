@@ -5,21 +5,34 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
 
-// 1. Move Logger to the absolute top
+// 1. Logger
 app.use((req, res, next) => {
   console.log(`>>> Incoming: ${req.method} ${req.path}`);
   next();
 });
 
-// 2. Other Middleware
-app.use(cors());
+// 2. CORS — allow both localhost (dev) and deployed frontend (prod)
+const allowedOrigins = [
+  'http://localhost:3000',
+  process.env.CLIENT_URL
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (e.g. mobile apps, curl)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true
+}));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Global Unhandled Rejection Log
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('!!! UNHANDLED REJECTION:', reason);
 });
 
@@ -32,117 +45,87 @@ app.use('/api/songs', songsRouter);
 app.use('/api/playlists', playlistsRouter);
 app.use('/api/user', userRouter);
 
-// Database Connection Settings
-const connectDB = async () => {
-  const fs = require('fs');
-  const path = require('path');
+// Health check
+app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-  try {
-    console.log('⏳ Attempting to connect to MongoDB Atlas...');
-    await mongoose.connect(process.env.MONGO_URI, {
-      serverSelectionTimeoutMS: 5000, 
-      connectTimeoutMS: 10000
-    });
-    console.log('✅ Success! Connected to MongoDB Atlas');
-  } catch (err) {
-    console.error('❌ Atlas Connection Failed:', err.message);
-    console.log('⚠️ Warning: Your IP might not be whitelisted. Booting up temporary local fallback database...');
-    
-    // Automatically fallback to memory server
-    const { MongoMemoryServer } = require('mongodb-memory-server');
-    const mongoServer = await MongoMemoryServer.create();
-    const uri = mongoServer.getUri();
-    
-    await mongoose.connect(uri);
-    console.log('✅ SUCCESS! Connected to local MongoDB Fallback Server.');
-    console.log('👉 NOTE: Any data saved now will be cleared when you stop the server.');
+// ── DATABASE CONNECTION (cached for serverless warm re-use) ──
+let isConnected = false;
+
+const connectDB = async () => {
+  if (isConnected) return; // Reuse existing connection on warm invocations
+
+  if (!process.env.MONGO_URI) {
+    throw new Error('MONGO_URI environment variable is not set. Add it to Vercel environment variables.');
   }
 
-  // AUTO-RESTORE LOGIC FROM PERSISTENT BACKUP JSON
-  try {
-    const Song = require('./models/Song');
-    const count = await Song.countDocuments();
-    const backupFile = path.join(__dirname, 'songs-backup.json');
-    if (fs.existsSync(backupFile)) {
-      const data = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
-      if (Array.isArray(data) && data.length > 0) {
-        console.log(`📡 Found persistent backup file with ${data.length} songs.`);
-        if (count === 0) {
-          console.log('🔄 Database is empty. Restoring backup songs...');
-          await Song.insertMany(data);
-          console.log('✅ Auto-restore complete!');
-        } else if (count < data.length) {
-          console.log(`🔄 Database has ${count} songs but backup has ${data.length} songs. Merging missing songs...`);
-          for (const s of data) {
-            const exists = await Song.exists({ _id: s._id });
-            if (!exists) {
-              await new Song(s).save();
-            }
-          }
-          console.log('✅ Auto-merge complete!');
-        }
-      }
-    }
+  console.log('⏳ Connecting to MongoDB Atlas...');
+  await mongoose.connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 10000,
+    connectTimeoutMS: 15000
+  });
+  isConnected = true;
+  console.log('✅ Connected to MongoDB Atlas');
 
-    // ── DATABASE HEALER: LINK EMPTY SONGS TO REAL AUDIO ──
-    const allSongs = await Song.find({});
-    const songsWithAudio = allSongs.filter(s => s.audioUrl && !s.audioUrl.includes('djs4euftl'));
-    if (songsWithAudio.length > 0) {
-      const normalize = (str) => str ? str.toLowerCase().replace(/[^a-z0-9]/g, '').trim() : '';
-      let healedCount = 0;
+  // AUTO-RESTORE from backup JSON (only runs in non-serverless / local mode)
+  if (process.env.NODE_ENV !== 'production') {
+    try {
+      const fs = require('fs');
+      const Song = require('./models/Song');
+      const count = await Song.countDocuments();
+      const backupFile = path.join(__dirname, 'songs-backup.json');
 
-      for (const song of allSongs) {
-        if (!song.audioUrl || song.audioUrl.includes('djs4euftl')) {
-          const normTitle = normalize(song.title);
-          
-          // Try to find a similar title match
-          let match = songsWithAudio.find(s => 
-            normalize(s.title).includes(normTitle) || 
-            normTitle.includes(normalize(s.title))
-          );
-          
-          // If no title match, pick a random song from the same genre
-          if (!match) {
-            const genreSongs = songsWithAudio.filter(s => s.genre === song.genre);
-            if (genreSongs.length > 0) {
-              match = genreSongs[Math.floor(Math.random() * genreSongs.length)];
-            } else {
-              match = songsWithAudio[Math.floor(Math.random() * songsWithAudio.length)];
+      if (fs.existsSync(backupFile)) {
+        const data = JSON.parse(fs.readFileSync(backupFile, 'utf8'));
+        if (Array.isArray(data) && data.length > 0) {
+          console.log(`📡 Found persistent backup with ${data.length} songs.`);
+          if (count === 0) {
+            console.log('🔄 Database is empty. Restoring backup songs...');
+            await Song.insertMany(data);
+            console.log('✅ Auto-restore complete!');
+          } else if (count < data.length) {
+            console.log(`🔄 Merging ${data.length - count} missing songs from backup...`);
+            for (const s of data) {
+              const exists = await Song.exists({ _id: s._id });
+              if (!exists) await new Song(s).save();
             }
-          }
-          
-          if (match) {
-            song.audioUrl = match.audioUrl;
-            await song.save();
-            healedCount++;
+            console.log('✅ Auto-merge complete!');
           }
         }
       }
-      if (healedCount > 0) {
-        console.log(`🌸 Database Healer: Automatically linked ${healedCount} default/empty songs to real uploaded audio tracks!`);
-        // Save the healed state to the backup file
-        const fsSongs = await Song.find({});
-        fs.writeFileSync(backupFile, JSON.stringify(fsSongs, null, 2));
-      }
+    } catch (restoreErr) {
+      console.error('⚠️ Auto-restore failed:', restoreErr.message);
     }
-  } catch (restoreErr) {
-    console.error('⚠️ Auto-restore/healer failed:', restoreErr.message);
   }
 };
 
+// Global error handler
 app.use((err, req, res, next) => {
   console.error('🔥 Global Server Error:', err);
-  res.status(500).json({ 
-    message: err.message || 'Internal Server Error', 
+  res.status(500).json({
+    message: err.message || 'Internal Server Error',
     stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
-    field: err.field || null 
+    field: err.field || null
   });
 });
 
-connectDB().then(() => {
-  // Start server only after database is ready
-  app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
+// ── STARTUP ──
+// On Vercel: module is imported, so we connect then export.
+// Locally: we connect then listen.
+if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+  // Serverless — connect eagerly and export the app
+  connectDB().catch(console.error);
+  module.exports = app;
+} else {
+  // Local dev — connect then start HTTP server
+  const PORT = process.env.PORT || 3002;
+  connectDB().then(() => {
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
+    });
+  }).catch(err => {
+    console.error('❌ Failed to connect to database:', err.message);
+    process.exit(1);
   });
-});
 
+  module.exports = app;
+}

@@ -1,12 +1,8 @@
 const multer = require('multer');
-const fs = require('fs');
-const path = require('path');
 
-// Ensure tmp directory exists
-const tmpDir = path.join(__dirname, '../tmp');
-if (!fs.existsSync(tmpDir)) {
-  fs.mkdirSync(tmpDir);
-}
+// On Vercel (and serverless environments), the only writable directory is /tmp.
+// Locally, we also use /tmp for consistency (it exists on all OSes).
+const tmpDir = '/tmp';
 
 // Entire Storage Configuration
 const storage = multer.diskStorage({
@@ -21,7 +17,7 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({ 
+const upload = multer({
   storage: storage,
   limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
 });
